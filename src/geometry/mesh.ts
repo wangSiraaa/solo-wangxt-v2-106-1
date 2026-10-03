@@ -48,7 +48,7 @@ export interface MeshInfo {
   basePitchMatch: boolean
   /** 基节差 */
   basePitchDiff: number
-  /** 中心距是否过小导致齿顶圆交叉（实体必干涉） */
+  /** 齿顶圆是否相互越过中心线（a<ra1+ra2）。标准外啮合下恒为 true 且不构成干涉，仅供几何参考；真正的实体碰撞以顶隙/ Clipper 求交为准 */
   addendumOverlap: boolean
   /** 接触路径（啮合线）在两轮齿顶圆之间的线段，世界坐标 */
   actionLine: { p0: Pt; p1: Pt }
@@ -87,12 +87,15 @@ export function analyzeMesh(input: PairInput): MeshInfo {
 
   const warnings: string[] = []
   const addendumOverlap = a < g1.addendumR + g2.addendumR
-  if (addendumOverlap) warnings.push('中心距小于两齿顶圆半径之和，齿顶圆交叉，必然实体干涉')
-  if (c12 < 0 || c21 < 0) warnings.push('存在齿顶与对方齿根圆交叉（顶隙为负）')
-  if (Math.abs(deltaA) > 1e-9) {
-    if (deltaA > 0) warnings.push(`非标准中心距（+${deltaA.toFixed(3)} mm）：有侧隙安装，啮合角增大，不再是无侧隙啮合`)
-    else warnings.push('中心距小于标准值：无侧隙空间，齿面相互挤压（仅教学演示干涉）')
-  }
+  // 注意：标准外啮合下齿顶圆恒相互越过中心线（ra1+ra2 > a0），齿顶圆"交叉"是常态，
+  // 齿顶落入对方齿槽空间，实体并不重叠；是否真正干涉由 Clipper 轮廓求交判定。
+  // 仅当中心距小到齿顶越过对方齿根圆（顶隙为负）时才是装配性实体碰撞。
+  const tipFoul = c12 < 0 || c21 < 0
+  if (tipFoul) warnings.push('中心距过小：齿顶圆越过对方齿根圆（顶隙为负），必然实体干涉')
+  if (a < g1.pitchR + g2.pitchR - 1e-9)
+    warnings.push('中心距小于标准值：无侧隙空间，齿面相互挤压（仅教学演示干涉）')
+  if (Math.abs(deltaA) > 1e-9 && deltaA > 0)
+    warnings.push(`非标准中心距（+${deltaA.toFixed(3)} mm）：有侧隙安装，啮合角增大，不再是无侧隙啮合`)
   if (!basePitchMatch) warnings.push(`两轮基节不等（差 ${basePitchDiff.toFixed(4)} mm），不能正确啮合`)
 
   // 节点 P
@@ -124,13 +127,25 @@ export function analyzeMesh(input: PairInput): MeshInfo {
   }
   const sOn1 = rootOnCircle(0, g1.addendumR)
   const sOn2 = rootOnCircle(a, g2.addendumR)
-  // 注意：作用线方向 n 指向 +y。
-  //  啮入端（s<0，轮2 齿顶先切入）受轮2 齿顶圆限制 → O2 的负根；
-  //  啮出端（s>0，轮1 齿顶退出）受轮1 齿顶圆限制 → O1 的正根。
-  const negRoots2 = sOn2.filter((v) => v <= 1e-9)
-  const posRoots1 = sOn1.filter((v) => v >= -1e-9)
-  const sEnter = negRoots2.length ? Math.max(...negRoots2) : s1
-  const sExit = posRoots1.length ? Math.min(...posRoots1) : s2v
+  // 接触路径端点（作用线方向 n 指向 +y）：
+  //  啮入端（s<0，右/从动轮齿顶先切入）由【右轮齿顶圆】限制；
+  //  啮出端（s>0，左/主动轮齿顶退出）由【左轮齿顶圆】限制。
+  // 齿顶圆与作用线可交于两点（节点 P 被齿顶圆包住时同侧会出现两个根），
+  // 真正的极限是该射线上【离 P 最近】的交点；若该射线无交点（P 已在齿顶圆内），
+  // 则回退到基圆切点（渐开线存在的理论极限）。
+  const nearNeg = (roots: number[]) => {
+    const rs = roots.filter((v) => v <= 1e-9)
+    return rs.length ? rs.reduce((x, y) => (Math.abs(x) < Math.abs(y) ? x : y)) : null
+  }
+  const nearPos = (roots: number[]) => {
+    const rs = roots.filter((v) => v >= -1e-9)
+    return rs.length ? rs.reduce((x, y) => (Math.abs(x) < Math.abs(y) ? x : y)) : null
+  }
+  const e2 = nearNeg(sOn2)
+  const x1 = nearPos(sOn1)
+  // 不能越过基圆切点（之外没有渐开线）
+  const sEnter = e2 != null ? Math.max(e2, s1) : s1
+  const sExit = x1 != null ? Math.min(x1, s2v) : s2v
   const pEnter: Pt = { x: P.x + sEnter * nx, y: P.y + sEnter * ny }
   const pExit: Pt = { x: P.x + sExit * nx, y: P.y + sExit * ny }
   const gAlpha = Math.max(0, sExit - sEnter)
@@ -155,7 +170,7 @@ export function analyzeMesh(input: PairInput): MeshInfo {
     pitchPoint: P,
     pathOfContact: gAlpha,
     contactRatio: epsilon,
-    ok: basePitchMatch && !addendumOverlap,
+    ok: basePitchMatch && !tipFoul,
     warnings
   }
 }
@@ -181,48 +196,78 @@ export function analyzeMesh(input: PairInput): MeshInfo {
  *   dφ2/ds = −cos²α′/rb2 − (+sin²α′/rb2) = −1/rb2
  * 即 rb1·Δφ1 = −rb2·Δφ2，ω2/ω1 = −z1/z2（外啮合反向），且全过程是同一条渐开线接触。
  */
-export function gearAnglesAt(mesh: MeshInfo, g1: GearGeometry, g2: GearGeometry, s: number) {
+/** 给定 s 左轮（局部布局中 O1，朝 +x 啮合）本体转角 */
+function leftAngleAt(mesh: MeshInfo, g1: GearGeometry, s: number) {
   const ap = mesh.alphaPrime
   const sn = Math.sin(ap),
     cn = Math.cos(ap)
   const t1 = Math.tan(ap) + s / g1.baseR
-  const t2 = Math.tan(ap) - s / g2.baseR
   const delta1 = t1 - Math.atan(t1)
-  const delta2 = t2 - Math.atan(t2)
-  // 本体齿面极角（外啮合：轮1 左齿面、轮2 右齿面；下方 ψ2 以 −x 为零角，
-  // 故轮2 在该镜像度量下也用"左齿面形式" π/2+β−δ，保证 dφ2/ds=−1/rb2）
   const theta1 = Math.PI / 2 + g1.beta - delta1
+  const psi1 = Math.atan2(s * cn, mesh.pitchR1 + s * sn) // 零角=+x
+  return psi1 - theta1
+}
+
+/** 给定 s 右轮（局部布局中 O2，朝 −x 啮合）本体转角 */
+function rightAngleAt(mesh: MeshInfo, g2: GearGeometry, s: number) {
+  const ap = mesh.alphaPrime
+  const sn = Math.sin(ap),
+    cn = Math.cos(ap)
+  const t2 = Math.tan(ap) - s / g2.baseR
+  const delta2 = t2 - Math.atan(t2)
+  // ψ2 以 −x 为零角，本体度量也采用镜像后的"左齿面形式" π/2+β−δ（dφ2/ds=−1/rb2）
   const theta2 = Math.PI / 2 + g2.beta - delta2
-  // 世界接触点方位（相对各自的"指向节点"零角）
-  const psi1 = Math.atan2(s * cn, mesh.pitchR1 + s * sn) // 轮1 零角=+x
-  const psi2 = Math.atan2(s * cn, -mesh.pitchR2 + s * sn) // 轮2 零角=−x
-  // 节点对齐常量
-  const phi1 = psi1 - theta1
-  const phi2 = psi2 - theta2
+  const psi2 = Math.atan2(s * cn, -mesh.pitchR2 + s * sn)
+  return psi2 - theta2
+}
+
+export function gearAnglesAt(mesh: MeshInfo, g1: GearGeometry, g2: GearGeometry, s: number) {
+  const ap = mesh.alphaPrime
+  const t1 = Math.tan(ap) + s / g1.baseR
+  const t2 = Math.tan(ap) - s / g2.baseR
+  const phi1 = leftAngleAt(mesh, g1, s)
+  const phi2 = rightAngleAt(mesh, g2, s)
   return { phi1, phi2, t1, t2 }
+}
+
+/**
+ * 由左轮本体转角反解接触线参数 s（dφ1/ds = 1/rb1 单调，牛顿法一步即收敛，
+ * 这里保留迭代仅为数值稳健）。多轮链从输入轴向后传播相位时用它取各段 s。
+ */
+export function invertContactS(mesh: MeshInfo, g1: GearGeometry, phiLeft: number): number {
+  let s = 0
+  for (let iter = 0; iter < 30; iter++) {
+    const f = leftAngleAt(mesh, g1, s) - phiLeft
+    s -= f / (1 / g1.baseR)
+    if (Math.abs(f) < 1e-12) break
+  }
+  return s
+}
+
+/**
+ * 由右轮本体转角反解接触线参数 s（dφ2/ds = −1/rb2）。
+ * 多轮链中"已知惰轮/右轮姿态，反推上游"时使用（如拖第二段接触点）。
+ */
+export function invertContactSFromRight(mesh: MeshInfo, g2: GearGeometry, phiRight: number): number {
+  let s = 0
+  for (let iter = 0; iter < 30; iter++) {
+    const f = rightAngleAt(mesh, g2, s) - phiRight
+    s -= f / (-1 / g2.baseR)
+    if (Math.abs(f) < 1e-12) break
+  }
+  return s
 }
 
 /** 轮1 本体转角 φ1 求配对转角 φ2：先反解 s 再走严格相位公式（保证同一条渐开线接触） */
 export function mateAngle(g1: GearGeometry, g2: GearGeometry, mesh: MeshInfo, phi1: number) {
-  const ap = mesh.alphaPrime
-  const sn = Math.sin(ap),
-    cn = Math.cos(ap)
-  // 由 φ1 = ψ1(s) − (π/2+β1−δ(t1)) 数值反解 s（dφ1/ds=1/rb1 单调，牛顿法）
-  let s = 0
-  for (let iter = 0; iter < 30; iter++) {
-    const t1 = Math.tan(ap) + s / g1.baseR
-    const delta1 = t1 - Math.atan(t1)
-    const theta1 = Math.PI / 2 + g1.beta - delta1
-    const psi1 = Math.atan2(s * cn, mesh.pitchR1 + s * sn)
-    const f = psi1 - theta1 - phi1
-    s -= f / (1 / g1.baseR)
-    if (Math.abs(f) < 1e-12) break
-  }
-  const t2 = Math.tan(ap) - s / g2.baseR
-  const delta2 = t2 - Math.atan(t2)
-  const theta2 = Math.PI / 2 + g2.beta - delta2
-  const psi2 = Math.atan2(s * cn, -mesh.pitchR2 + s * sn)
-  return psi2 - theta2
+  const s = invertContactS(mesh, g1, phi1)
+  return rightAngleAt(mesh, g2, s)
+}
+
+/** 反向配对：已知右轮本体转角 φ2，反解左轮 φ1（惰轮作为第二段左轮时的上游传播） */
+export function mateAngleInverse(g1: GearGeometry, g2: GearGeometry, mesh: MeshInfo, phi2: number) {
+  const s = invertContactSFromRight(mesh, g2, phi2)
+  return leftAngleAt(mesh, g1, s)
 }
 
 /** 接触点世界坐标 */

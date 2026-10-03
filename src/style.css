@@ -82,3 +82,10 @@ th { color: #9fb4cf; font-weight: 600; }
 .ca { display: flex; gap: 4px; align-items: center; }
 .ca button { flex: 0 0 auto; padding: 3px 8px; }
 .empty { color: #6b7686; justify-content: center !important; }
+
+.gearblock { border: 1px solid #232d3a; border-radius: 6px; padding: 6px 8px; margin: 8px 0; background: #0f141c; }
+.gearhead { font-size: 12px; color: #9fb4cf; font-weight: 600; margin-bottom: 2px; }
+.stageblock { border-left: 3px solid #2b5ea8; padding: 4px 8px; margin: 6px 0; background: #0f141c; border-radius: 0 6px 6px 0; }
+.chainerr { margin-top: 8px; padding: 6px; border: 1px solid #5c2f3f; border-radius: 6px; background: #1c1218; }
+.stageline { margin: 2px 0; color: #aab6c6; }
+.banned { color: #ff7a90; font-size: 13px; padding: 10px 4px; }

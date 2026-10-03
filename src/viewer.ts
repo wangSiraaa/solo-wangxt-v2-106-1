@@ -1,11 +1,15 @@
 /**
- * Three.js 场景：直齿轮 3D 齿形 + 参考圆 + 啮合线/接触点 + 旋转运动。
+ * Three.js 场景：2/3 个直齿轮的 3D 齿形 + 参考圆 + 啮合线/接触点 + 旋转运动。
  * 纯前端、OrbitControls 由 three 自带模块提供。
+ *
+ * 传动链视图：所有齿轮沿 x 轴排列（中心由 TrainModel.centers 给出），
+ * 覆盖物（啮合线、节点、接触点、干涉区）只画当前"被检查的啮合副"那一段，
+ * 可在段 0 / 段 1 之间切换。
  */
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import type { GearGeometry, Pt } from './geometry/gear'
-import type { MeshInfo } from './geometry/mesh'
+import type { StageView } from './geometry/train'
 
 export interface ViewerOptions {
   showPitchCircle: boolean
@@ -14,24 +18,28 @@ export interface ViewerOptions {
   showDedendumCircle: boolean
   showActionLine: boolean
   showContact: boolean
-  contactS: number // 啮合线参数 s（mm），仅 showContact 时
-  contactRegions?: Pt[][][] // Clipper 干涉区域（世界坐标，按帧）
+  /** 当前被检查的啮合副段号 */
+  selectedStage: number
+  /** 该段接触线参数 s（mm），仅 showContact 时 */
+  contactS: number
+  /** 各段 Clipper 干涉区域（世界坐标）；只渲染 selectedStage 段 */
+  contactRegions: Pt[][][]
 }
 
 interface GearMesh {
   group: THREE.Group
   body: THREE.Mesh
-  // 参考圆线段
   refs: Record<string, THREE.LineLoop>
 }
+
+const GEAR_COLORS = [0x6ea8fe, 0xffb86e, 0x6fe0a0]
 
 export class GearViewer {
   readonly renderer: THREE.WebGLRenderer
   readonly scene: THREE.Scene
   readonly camera: THREE.OrthographicCamera
   private controls: OrbitControls
-  private gear1: GearMesh | null = null
-  private gear2: GearMesh | null = null
+  private gears: GearMesh[] = []
   private actionLine: THREE.Line | null = null
   private tangentLine: THREE.Line | null = null
   private pitchPoint: THREE.Mesh | null = null
@@ -145,21 +153,25 @@ export class GearViewer {
     return { group, body, refs }
   }
 
-  setGears(g1: GearGeometry, g2: GearGeometry, centerDistance: number) {
-    if (this.gear1) this.scene.remove(this.gear1.group)
-    if (this.gear2) this.scene.remove(this.gear2.group)
-    this.gear1 = this.buildGearMesh(g1, 0x6ea8fe)
-    this.gear2 = this.buildGearMesh(g2, 0xffb86e)
-    this.scene.add(this.gear1.group, this.gear2.group)
-    this.gear2.group.position.x = centerDistance
-    // 让整对齿轮大致居中
-    this.targetCenter(centerDistance / 2, Math.max(g1.addendumR, g2.addendumR))
+  /** 装入整条传动链（2 或 3 个齿轮，沿 x 轴布置）；空数组表示链条被拒绝形成 */
+  setTrain(gears: GearGeometry[], centers: number[]) {
+    for (const gm of this.gears) this.scene.remove(gm.group)
+    this.gears = gears.map((g, i) => this.buildGearMesh(g, GEAR_COLORS[i] ?? 0xcccccc))
+    this.gears.forEach((gm, i) => {
+      gm.group.position.x = centers[i]
+      this.scene.add(gm.group)
+    })
+    if (!gears.length) return
+    const span = centers[centers.length - 1] || 0
+    const maxR = Math.max(...gears.map((g) => g.addendumR))
+    this.targetCenter(span / 2, maxR, span + maxR * 2)
   }
 
-  private targetCenter(cx: number, radius: number) {
+  private targetCenter(cx: number, radius: number, width: number) {
     const aspect = (this.container.clientWidth || 800) / (this.container.clientHeight || 600)
-    const need = (radius * 2 + 40) / 2
-    const frustum = Math.max(need * 2, 80)
+    const needV = radius * 2 + 40
+    const needH = width + 40
+    const frustum = Math.max(needV, needH / aspect, 80)
     this.camera.left = (-frustum * aspect) / 2
     this.camera.right = (frustum * aspect) / 2
     this.camera.top = frustum / 2
@@ -169,38 +181,43 @@ export class GearViewer {
     this.camera.position.set(cx, 0, 140)
   }
 
-  setAngles(phi1: number, phi2: number) {
-    if (this.gear1) this.gear1.group.rotation.z = phi1
-    if (this.gear2) this.gear2.group.rotation.z = phi2
+  setTrainAngles(angles: number[]) {
+    angles.forEach((phi, i) => {
+      if (this.gears[i]) this.gears[i].group.rotation.z = phi
+    })
   }
 
-  setMeshOverlay(mesh: MeshInfo | null, opts: ViewerOptions) {
+  /**
+   * 刷新覆盖物。参考圆作用于全部齿轮；啮合线/节点/接触点/干涉区只属于
+   * opts.selectedStage 指定的那一段（在两个啮合副之间切换检查）。
+   */
+  setTrainOverlay(stages: StageView[], opts: ViewerOptions) {
     this.clearOverlay()
-    if (!mesh || !this.gear1 || !this.gear2) return
+    if (!this.gears.length) return
+    const stage = stages[opts.selectedStage] ?? stages[0]
+    if (!stage) return
 
     const show = (key: keyof ViewerOptions) => opts[key] as boolean
 
-    // 两齿轮齿宽（挤出深度），用于把覆盖物放到前端面之上
     const bodyDepth = (m: THREE.Mesh) => {
       m.geometry.computeBoundingBox()
       const bb = m.geometry.boundingBox
       return bb ? bb.max.z - bb.min.z : 0
     }
-    const g1Depth = bodyDepth(this.gear1.body)
-    const g2Depth = bodyDepth(this.gear2.body)
+    const maxDepth = Math.max(...this.gears.map((gm) => bodyDepth(gm.body)))
 
-    this.gear1.refs.pitch.visible = !!show('showPitchCircle')
-    this.gear2.refs.pitch.visible = !!show('showPitchCircle')
-    this.gear1.refs.base.visible = !!show('showBaseCircle')
-    this.gear2.refs.base.visible = !!show('showBaseCircle')
-    this.gear1.refs.addendum.visible = !!show('showAddendumCircle')
-    this.gear2.refs.addendum.visible = !!show('showAddendumCircle')
-    this.gear1.refs.dedendum.visible = !!show('showDedendumCircle')
-    this.gear2.refs.dedendum.visible = !!show('showDedendumCircle')
+    for (const gm of this.gears) {
+      gm.refs.pitch.visible = !!show('showPitchCircle')
+      gm.refs.base.visible = !!show('showBaseCircle')
+      gm.refs.addendum.visible = !!show('showAddendumCircle')
+      gm.refs.dedendum.visible = !!show('showDedendumCircle')
+    }
+
+    // 段内几何平移到世界坐标（局部布局中左轮中心在 x=0）
+    const tx = (p: Pt): Pt => ({ x: p.x + stage.cxLeft, y: p.y })
 
     if (show('showActionLine')) {
-      // 覆盖在两齿轮前端面之上并关闭深度测试，保证任何视角都能看到啮合线
-      const z = Math.max(g1Depth, g2Depth) / 2 + 1
+      const z = maxDepth / 2 + 1
       const mk = (p: Pt, q: Pt, color: number) => {
         const geo = new THREE.BufferGeometry().setFromPoints([
           new THREE.Vector3(p.x, p.y, z),
@@ -216,34 +233,32 @@ export class GearViewer {
           })
         )
       }
-      this.tangentLine = mk(mesh.tangentLine.p0, mesh.tangentLine.p1, 0x8893a3)
+      this.tangentLine = mk(tx(stage.info.tangentLine.p0), tx(stage.info.tangentLine.p1), 0x8893a3)
       this.tangentLine.renderOrder = 50
-      this.actionLine = mk(mesh.actionLine.p0, mesh.actionLine.p1, 0x39e66b)
+      this.actionLine = mk(tx(stage.info.actionLine.p0), tx(stage.info.actionLine.p1), 0x39e66b)
       this.actionLine.renderOrder = 51
       this.scene.add(this.tangentLine, this.actionLine)
 
-      const dotGeo = new THREE.SphereGeometry(0.7, 16, 16)
+      const P = tx(stage.info.pitchPoint)
       this.pitchPoint = new THREE.Mesh(
-        dotGeo,
+        new THREE.SphereGeometry(0.7, 16, 16),
         new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false })
       )
-      this.pitchPoint.position.set(mesh.pitchPoint.x, mesh.pitchPoint.y, z)
+      this.pitchPoint.position.set(P.x, P.y, z)
       this.pitchPoint.renderOrder = 52
       this.scene.add(this.pitchPoint)
     }
 
     if (show('showContact')) {
-      const ap = mesh.alphaPrime
-      const nx = Math.sin(ap),
-        ny = Math.cos(ap)
+      const ap = stage.info.alphaPrime
+      const P = tx(stage.info.pitchPoint)
       const c = {
-        x: mesh.pitchPoint.x + opts.contactS * nx,
-        y: mesh.pitchPoint.y + opts.contactS * ny
+        x: P.x + opts.contactS * Math.sin(ap),
+        y: P.y + opts.contactS * Math.cos(ap)
       }
-      const z = Math.max(g1Depth, g2Depth) / 2 + 1.5
-      const dotGeo = new THREE.SphereGeometry(1.0, 20, 20)
+      const z = maxDepth / 2 + 1.5
       this.contactMarker = new THREE.Mesh(
-        dotGeo,
+        new THREE.SphereGeometry(1.0, 20, 20),
         new THREE.MeshBasicMaterial({ color: 0xff3b6b, depthTest: false })
       )
       this.contactMarker.position.set(c.x, c.y, z)
@@ -251,27 +266,26 @@ export class GearViewer {
       this.scene.add(this.contactMarker)
     }
 
-    if (opts.contactRegions) {
-      for (const regionSet of opts.contactRegions) {
-        for (const ring of regionSet) {
-          if (ring.length < 3) continue
-          const shape = new THREE.Shape()
-          shape.moveTo(ring[0].x, ring[0].y)
-          for (let i = 1; i < ring.length; i++) shape.lineTo(ring[i].x, ring[i].y)
-          shape.closePath()
-          const geo = new THREE.ShapeGeometry(shape)
-          const mat = new THREE.MeshBasicMaterial({
-            color: 0xff2d55,
-            transparent: true,
-            opacity: 0.5,
-            side: THREE.DoubleSide,
-            depthTest: false
-          })
-          const m = new THREE.Mesh(geo, mat)
-          m.position.z = Math.max(g1Depth, g2Depth) / 2 + 2
-          m.renderOrder = 999
-          this.interferenceGroup.add(m)
-        }
+    const regionSet = opts.contactRegions[opts.selectedStage]
+    if (regionSet) {
+      for (const ring of regionSet) {
+        if (ring.length < 3) continue
+        const shape = new THREE.Shape()
+        shape.moveTo(ring[0].x, ring[0].y)
+        for (let i = 1; i < ring.length; i++) shape.lineTo(ring[i].x, ring[i].y)
+        shape.closePath()
+        const geo = new THREE.ShapeGeometry(shape)
+        const mat = new THREE.MeshBasicMaterial({
+          color: 0xff2d55,
+          transparent: true,
+          opacity: 0.5,
+          side: THREE.DoubleSide,
+          depthTest: false
+        })
+        const m = new THREE.Mesh(geo, mat)
+        m.position.z = maxDepth / 2 + 2
+        m.renderOrder = 999
+        this.interferenceGroup.add(m)
       }
     }
   }

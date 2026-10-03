@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, shallowRef, watch } from 'vue'
-import { buildGear, validateGearInput, DEG, transformOutline, type GearGeometry, type Pt } from './geometry/gear'
-import { analyzeMesh, gearAnglesAt, mateAngle, type MeshInfo } from './geometry/mesh'
+import { DEG, transformOutline, type Pt } from './geometry/gear'
 import { intersectOutlines } from './geometry/clipper'
 import { GearViewer, type ViewerOptions } from './viewer'
 import { UNITS, fromMm, toMm, fmtLen, type LengthUnit } from './units'
 import {
   type CaseData,
+  type CaseGearInput,
+  type StageInterference,
   downloadJson,
   listCases,
   newCaseId,
@@ -14,131 +15,225 @@ import {
   saveCase,
   deleteCase
 } from './store'
+import {
+  buildTrain,
+  poseFromFirst,
+  poseFromStageS,
+  stageSBounds,
+  wrapStageS,
+  type TrainKind,
+  type TrainModel,
+  type TrainPose
+} from './geometry/train'
 
-// ------- 参数（内部全部 mm / 度） -------
+// ------- 全局 -------
 const unit = ref<LengthUnit>('mm')
+const kind = ref<TrainKind>('pair')
 
-const gearParams = reactive({
-  z1: 20,
-  z2: 40,
-  m: 2, // mm
-  alphaDeg: 20,
-  faceWidth: 10,
-  centerDistance: 60, // mm
-  useStandardCenter: true
-})
+interface EditableGear {
+  z: number
+  module: number // mm
+  alphaDeg: number
+  faceWidth: number // mm
+}
+// 始终保留 3 个槽位；双轮模式只用前两个，切换到三轮时第三个参数还在
+const specs = reactive<EditableGear[]>([
+  { z: 20, module: 2, alphaDeg: 20, faceWidth: 10 },
+  { z: 40, module: 2, alphaDeg: 20, faceWidth: 10 },
+  { z: 30, module: 2, alphaDeg: 20, faceWidth: 10 }
+])
+/** 各段是否使用标准中心距 */
+const stageStd = reactive<boolean[]>([true, true])
+/** 非标准时各段实际中心距（mm） */
+const stageCenter = reactive<number[]>([60, 70])
 
-const g1 = shallowRef<GearGeometry>()
-const g2 = shallowRef<GearGeometry>()
-const mesh = shallowRef<MeshInfo>()
+const gearErrors = ref<string[][]>([[], [], []])
+const chainErrors = ref<string[]>([])
+const model = shallowRef<TrainModel | null>(null)
 
-const errors = reactive({ g1: [] as string[], g2: [] as string[] })
+/** 载入案例时带来的轮廓（局部坐标）；参数改动后清空，回退到按参数重建 */
+let storedOutlines: Pt[][] | null = null
+let editingId: string | null = null
+/** 载入案例过程中抑制参数 watcher（避免它清掉随案例载入的轮廓/ID 并重复重建） */
+let applyingCase = false
 
-function rebuild() {
-  const in1 = { z: Math.round(gearParams.z1), module: gearParams.m, alpha: gearParams.alphaDeg * DEG, faceWidth: gearParams.faceWidth }
-  const in2 = { z: Math.round(gearParams.z2), module: gearParams.m, alpha: gearParams.alphaDeg * DEG, faceWidth: gearParams.faceWidth }
-  errors.g1 = validateGearInput(in1)
-  errors.g2 = validateGearInput(in2)
-  if (errors.g1.length || errors.g2.length) return
-  g1.value = buildGear(in1)
-  g2.value = buildGear(in2)
-  const a = gearParams.useStandardCenter
-    ? g1.value.pitchR + g2.value.pitchR
-    : gearParams.centerDistance
-  mesh.value = analyzeMesh({ g1: g1.value, g2: g2.value, centerDistance: a })
+function activeCount() {
+  return kind.value === 'idler' ? 3 : 2
 }
 
-// ------- 单位输入辅助（数值随单位换算；内部 mm 不变） -------
-const mInput = computed({
-  get: () => fromMm(gearParams.m, unit.value),
-  set: (v: number) => (gearParams.m = toMm(v, unit.value))
-})
-const faceInput = computed({
-  get: () => fromMm(gearParams.faceWidth, unit.value),
-  set: (v: number) => (gearParams.faceWidth = toMm(v, unit.value))
-})
-const centerInput = computed({
-  get: () => fromMm(gearParams.centerDistance, unit.value),
-  set: (v: number) => (gearParams.centerDistance = toMm(v, unit.value))
-})
+function rebuild() {
+  const n = activeCount()
+  const gears = specs.slice(0, n).map<CaseGearInput>((g) => ({
+    z: Math.round(g.z),
+    module: g.module,
+    alpha: g.alphaDeg * DEG,
+    alphaDeg: g.alphaDeg,
+    faceWidth: g.faceWidth
+  }))
+  const centerDistances = []
+  for (let i = 0; i < n - 1; i++) {
+    if (stageStd[i]) centerDistances.push(null)
+    else centerDistances.push(stageCenter[i])
+  }
+  const m = buildTrain({ kind: kind.value, gears, centerDistances })
+  gearErrors.value = [
+    specs[0] ? validateOne(0) : [],
+    specs[1] ? validateOne(1) : [],
+    n === 3 ? validateOne(2) : []
+  ]
+  if (m.ok) {
+    model.value = m
+    chainErrors.value = []
+    // 非标准中心距输入框回填实际标准值作参考
+    for (let i = 0; i < m.stages.length; i++) {
+      if (stageStd[i]) stageCenter[i] = m.stages[i].info.a0
+    }
+  } else {
+    // 拒绝形成半成品链条：视图清空，只显示原因
+    model.value = null
+    chainErrors.value = m.errors
+    viewer?.setTrain([], [])
+    return
+  }
+  viewer?.setTrain(m.gears, m.centers)
+  selectedStage.value = Math.min(selectedStage.value, m.stages.length - 1)
+  phiFirst.value = 0
+  pose.value = poseFromFirst(m, 0)
+  scrubS.value = pose.value.s[selectedStage.value] ?? 0
+  interferenceResults.value = m.stages.map(() => null)
+}
 
-watch(unit, () => {})
+function validateOne(i: number): string[] {
+  const g = specs[i]
+  const errs: string[] = []
+  if (!Number.isFinite(g.z) || g.z < 4 || Math.abs(g.z - Math.round(g.z)) > 1e-9)
+    errs.push('齿数须为 ≥4 的整数')
+  if (!(g.module > 0) || !Number.isFinite(g.module)) errs.push('模数须 > 0')
+  if (!(g.alphaDeg > 0) || g.alphaDeg >= 90) errs.push('压力角须在 (0°,90°)')
+  if (!(g.faceWidth > 0)) errs.push('齿宽须 > 0')
+  return errs
+}
 
-// ------- 动画 -------
+// ------- 单位输入辅助（内部恒为 mm） -------
+function mmField(i: number, key: 'module' | 'faceWidth') {
+  return computed({
+    get: () => fromMm(specs[i][key], unit.value),
+    set: (v: number) => (specs[i][key] = toMm(v, unit.value))
+  })
+}
+function stageCenterField(i: number) {
+  return computed({
+    get: () => fromMm(stageCenter[i], unit.value),
+    set: (v: number) => (stageCenter[i] = toMm(v, unit.value))
+  })
+}
+const mFields = [mmField(0, 'module'), mmField(1, 'module'), mmField(2, 'module')]
+const bFields = [mmField(0, 'faceWidth'), mmField(1, 'faceWidth'), mmField(2, 'faceWidth')]
+const cFields = [stageCenterField(0), stageCenterField(1)]
+
+// ------- 运动 / 姿态 -------
 const playing = ref(true)
-const phi1 = ref(0)
-const speed = ref(0.25) // rad/s（轮1）
+const phiFirst = ref(0)
+const speed = ref(0.25) // rad/s（首轮）
 let lastT = 0
-const contactS = ref(0)
+const pose = shallowRef<TrainPose>({ angles: [0, 0, 0], s: [0, 0], contacts: [] })
+const selectedStage = ref(0)
+const scrubS = ref(0)
 
-const showOpts = reactive<ViewerOptions>({
+const showOpts = reactive({
   showPitchCircle: true,
   showBaseCircle: true,
   showAddendumCircle: false,
   showDedendumCircle: false,
   showActionLine: true,
-  showContact: true,
-  contactS: 0
+  showContact: true
 })
 
-// ------- 干涉 -------
-const interferenceArea = ref<number | null>(null)
-const interferenceRegions = shallowRef<Pt[][]>([])
-const interferenceBusy = ref(false)
+// ------- 各段局部干涉检查（Clipper2 WASM） -------
+const interferenceResults = shallowRef<(StageInterference | null)[]>([null, null])
+const busyStages = reactive<boolean[]>([false, false])
 let interfereReq = 0
 
-async function checkInterference(currentPhi1: number) {
-  if (!g1.value || !g2.value || !mesh.value) return
-  const p1 = currentPhi1
-  const p2 = mateAngle(g1.value, g2.value, mesh.value, p1)
-  const o1 = [transformOutline(g1.value.outline, 0, 0, p1)]
-  const o2 = [transformOutline(g2.value.outline, mesh.value.a, 0, p2)]
+function localOutline(i: number): Pt[] {
+  return storedOutlines && storedOutlines[i] ? storedOutlines[i] : model.value!.gears[i].outline
+}
+
+async function checkStageInterference(i: number) {
+  const m = model.value
+  if (!m || playing.value) return
+  const st = m.stages[i]
+  const p = pose.value
+  const oL = [transformOutline(localOutline(st.leftIndex), m.centers[st.leftIndex], 0, p.angles[st.leftIndex])]
+  const oR = [transformOutline(localOutline(st.rightIndex), m.centers[st.rightIndex], 0, p.angles[st.rightIndex])]
   const req = ++interfereReq
-  interferenceBusy.value = true
+  busyStages[i] = true
   try {
-    const res = await intersectOutlines(o1, o2)
+    const res = await intersectOutlines(oL, oR)
     if (req !== interfereReq) return
-    interferenceArea.value = res.area
-    interferenceRegions.value = res.regions
+    // 逐槽替换（shallowRef 触发更新）
+    const next = [...interferenceResults.value]
+    next[i] = { stageIndex: i, angles: [...p.angles], regions: res.regions, area: res.area }
+    interferenceResults.value = next
   } finally {
-    if (req === interfereReq) interferenceBusy.value = false
+    if (req === interfereReq) busyStages[i] = false
   }
+}
+
+async function checkAllStages() {
+  if (!model.value) return
+  for (let i = 0; i < model.value.stages.length; i++) await checkStageInterference(i)
 }
 
 // ------- 视图 -------
 const host = ref<HTMLDivElement>()
 let viewer: GearViewer | null = null
 
+/** 当前选中段接触点显示用 s（折叠进实际啮合段；拖动时取真实 s） */
+const displayContactS = computed(() => {
+  const m = model.value
+  if (!m || !m.stages[selectedStage.value]) return 0
+  return wrapStageS(m.stages[selectedStage.value], pose.value.s[selectedStage.value] ?? 0)
+})
+
+const sBounds = computed<[number, number]>(() => {
+  const st = model.value?.stages[selectedStage.value]
+  if (!st) return [-30, 30]
+  const [lo, hi] = stageSBounds(st)
+  return [Math.floor(lo * 10) / 10, Math.ceil(hi * 10) / 10]
+})
+
 function pushOverlay() {
-  if (!viewer || !mesh.value) return
-  viewer.setMeshOverlay(mesh.value, {
+  const m = model.value
+  if (!viewer || !m) return
+  const opts: ViewerOptions = {
     ...showOpts,
-    contactS: contactS.value,
-    contactRegions: [interferenceRegions.value]
-  })
+    selectedStage: selectedStage.value,
+    contactS: displayContactS.value,
+    contactRegions: m.stages.map((_, i) => interferenceResults.value[i]?.regions ?? [])
+  }
+  viewer.setTrainOverlay(m.stages, opts)
 }
 
 onMounted(() => {
   rebuild()
   viewer = new GearViewer(host.value!)
-  if (g1.value && g2.value && mesh.value) viewer.setGears(g1.value, g2.value, mesh.value.a)
+  if (model.value) viewer.setTrain(model.value.gears, model.value.centers)
 
   const loop = (t: number) => {
     const dt = Math.min(0.05, (t - lastT) / 1000 || 0)
     lastT = t
-    if (playing.value && g1.value && g2.value && mesh.value) {
-      phi1.value += speed.value * dt
-      // 归一到一个齿距周期，避免数值增长
-      const period = (2 * Math.PI) / g1.value.input.z
-      phi1.value = ((phi1.value % period) + period) % period
-      // 接触点 s 随 φ1 同步：dφ1/ds = 1/rb1，相位常量按节点对齐
-      const s = (phi1.value - (gearAnglesAt(mesh.value, g1.value, g2.value, 0).phi1)) * g1.value.baseR
-      contactS.value = clampS(s)
+    const m = model.value
+    if (playing.value && m) {
+      phiFirst.value += speed.value * dt
+      // 归一到首轮一个齿距周期（链中各轮周期严格相容：Δφ1=2π/z1 ⇒ Δφk=±2π/zk）
+      const period = (2 * Math.PI) / m.gears[0].input.z
+      phiFirst.value = ((phiFirst.value % period) + period) % period
+      pose.value = poseFromFirst(m, phiFirst.value)
+      scrubS.value = displayContactS.value
     }
-    if (g1.value && g2.value && mesh.value) {
-      const p2 = mateAngle(g1.value, g2.value, mesh.value, phi1.value)
-      viewer!.setAngles(phi1.value, p2)
-      showOpts.contactS = contactS.value
+    if (m && viewer) {
+      viewer.setTrainAngles(pose.value.angles)
+      scrubS.value = displayContactS.value
       pushOverlay()
     }
     requestAnimationFrame(loop)
@@ -146,36 +241,25 @@ onMounted(() => {
   requestAnimationFrame(loop)
 })
 
-function clampS(s: number) {
-  if (!mesh.value) return 0
-  const a = mesh.value.actionLine
-  const ap = mesh.value.alphaPrime
-  const nx = Math.sin(ap),
-    ny = Math.cos(ap)
-  const sLo =
-    (a.p0.x - mesh.value.pitchPoint.x) * nx + (a.p0.y - mesh.value.pitchPoint.y) * ny
-  const sHi =
-    (a.p1.x - mesh.value.pitchPoint.x) * nx + (a.p1.y - mesh.value.pitchPoint.y) * ny
-  // 超出区间则循环到下一齿（让接触点重新进入）
-  if (s < sLo) return sHi - ((sLo - s) % (sHi - sLo))
-  if (s > sHi) return sLo + ((s - sHi) % (sHi - sLo))
-  return s
-}
-
 watch(
-  () => [gearParams.z1, gearParams.z2, gearParams.m, gearParams.alphaDeg, gearParams.faceWidth, gearParams.useStandardCenter, gearParams.centerDistance],
+  () => [
+    kind.value,
+    specs[0].z, specs[0].module, specs[0].alphaDeg, specs[0].faceWidth,
+    specs[1].z, specs[1].module, specs[1].alphaDeg, specs[1].faceWidth,
+    specs[2].z, specs[2].module, specs[2].alphaDeg, specs[2].faceWidth,
+    stageStd[0], stageStd[1], stageCenter[0], stageCenter[1]
+  ],
   () => {
+    // 参数编辑后旧案例轮廓/检查结果失效；载入案例期间由 applyCase 统一处理
+    if (applyingCase) return
+    storedOutlines = null
+    editingId = null
     rebuild()
-    if (viewer && g1.value && g2.value && mesh.value) viewer.setGears(g1.value, g2.value, mesh.value.a)
-    phi1.value = 0
-    contactS.value = 0
-    interferenceArea.value = null
-    interferenceRegions.value = []
   }
 )
 
 watch(showOpts, pushOverlay)
-watch(contactS, () => (showOpts.contactS = contactS.value))
+watch(selectedStage, () => (scrubS.value = displayContactS.value))
 
 // ------- 暂停时手动检查 -------
 function pause() {
@@ -185,10 +269,16 @@ function resume() {
   playing.value = true
 }
 
-/** 暂停时手动拖动接触点：把轮1 转到与该 s 严格对应的相位（同一条渐开线接触） */
+/** 暂停时拖动选中段接触点：全链姿态由该段真实啮合反推（上下游同时更新） */
 function scrubContact() {
-  if (playing.value || !g1.value || !g2.value || !mesh.value) return
-  phi1.value = gearAnglesAt(mesh.value, g1.value, g2.value, contactS.value).phi1
+  const m = model.value
+  if (playing.value || !m) return
+  const p = poseFromStageS(m, selectedStage.value, scrubS.value)
+  pose.value = p
+  phiFirst.value = p.angles[0]
+  // 姿态改变后，旧帧的干涉检查结果不再对应当前三轮姿态（结果是按当时角度算的），
+  // 清空以免红区/面积被误读为当前姿态；保存案例时也不会再带走过期结果
+  interferenceResults.value = m.stages.map(() => null)
 }
 
 // ------- 案例库 -------
@@ -202,67 +292,95 @@ async function refreshCases() {
 onMounted(refreshCases)
 
 function currentCaseData(withOutlines: boolean): CaseData {
-  const a = mesh.value?.a ?? gearParams.centerDistance
+  const m = model.value
+  const n = activeCount()
+  const id = editingId ?? newCaseId()
   return {
-    schemaVersion: 1,
-    id: newCaseId(),
+    schemaVersion: 2,
+    id,
     name: caseName.value,
     createdAt: Date.now(),
     updatedAt: Date.now(),
     note: caseNote.value,
-    gear1: {
-      z: gearParams.z1,
-      module: gearParams.m,
-      alpha: gearParams.alphaDeg * DEG,
-      alphaDeg: gearParams.alphaDeg,
-      faceWidth: gearParams.faceWidth
-    },
-    gear2: {
-      z: gearParams.z2,
-      module: gearParams.m,
-      alpha: gearParams.alphaDeg * DEG,
-      alphaDeg: gearParams.alphaDeg,
-      faceWidth: gearParams.faceWidth
-    },
-    centerDistance: gearParams.useStandardCenter ? null : a,
+    kind: kind.value,
+    gears: specs.slice(0, n).map<CaseGearInput>((g) => ({
+      z: Math.round(g.z),
+      module: g.module,
+      alpha: g.alphaDeg * DEG,
+      alphaDeg: g.alphaDeg,
+      faceWidth: g.faceWidth
+    })),
+    centerDistances: Array.from({ length: n - 1 }, (_, i) => (stageStd[i] ? null : stageCenter[i])),
     unit: unit.value,
+    pose: m ? pose.value.angles.slice(0, n) : undefined,
+    selectedStage: selectedStage.value,
+    contactS: m ? pose.value.s.slice(0, n - 1) : undefined,
     outlines:
-      withOutlines && g1.value && g2.value
-        ? { gear1: g1.value.outline, gear2: g2.value.outline }
+      withOutlines && m
+        ? {
+            gears: m.gears.map((_, i) => localOutline(i)),
+            interference: interferenceResults.value.filter(Boolean) as StageInterference[]
+          }
         : undefined
   }
 }
 
 async function saveCurrent(withOutlines: boolean) {
-  await saveCase(currentCaseData(withOutlines))
+  if (!model.value) return
+  const data = currentCaseData(withOutlines)
+  await saveCase(data)
+  editingId = data.id
   await refreshCases()
 }
 
 function exportCase(withOutlines: boolean) {
+  if (!model.value) return
   downloadJson(currentCaseData(withOutlines))
 }
 
-async function loadCase(c: CaseData) {
-  gearParams.z1 = c.gear1.z
-  gearParams.z2 = c.gear2.z
-  gearParams.m = c.gear1.module
-  gearParams.alphaDeg = c.gear1.alphaDeg
-  gearParams.faceWidth = c.gear1.faceWidth
-  if (c.centerDistance == null) {
-    gearParams.useStandardCenter = true
-  } else {
-    gearParams.useStandardCenter = false
-    gearParams.centerDistance = c.centerDistance
+function applyCase(c: CaseData) {
+  applyingCase = true
+  kind.value = c.kind
+  const n = c.kind === 'idler' ? 3 : 2
+  c.gears.forEach((g, i) => {
+    specs[i] = { z: g.z, module: g.module, alphaDeg: g.alphaDeg, faceWidth: g.faceWidth }
+  })
+  for (let i = 0; i < n - 1; i++) {
+    const v = c.centerDistances[i]
+    stageStd[i] = v == null
+    if (v != null) stageCenter[i] = v
   }
   unit.value = c.unit || 'mm'
   caseName.value = c.name
   caseNote.value = c.note
-  rebuild()
-  if (viewer && g1.value && g2.value && mesh.value) viewer.setGears(g1.value, g2.value, mesh.value.a)
+  editingId = c.id
+  rebuild() // viewer 重建（此时 storedOutlines 尚未设置，下面再恢复检查结果）
+  const m = model.value
+  if (m) {
+    selectedStage.value = Math.min(c.selectedStage ?? 0, m.stages.length - 1)
+    // 恢复暂停姿态（严格逐段啮合重新推导；轮廓核验另有保存的角度）
+    const phi0 = c.pose && c.pose.length === n ? c.pose[0] : 0
+    phiFirst.value = phi0
+    pose.value = poseFromFirst(m, phi0)
+    scrubS.value = displayContactS.value
+    // 恢复随案例保存的局部轮廓与两段检查结果（不被重建）
+    storedOutlines = c.outlines ? c.outlines.gears.map((p) => p.map((q) => ({ ...q }))) : null
+    interferenceResults.value = m.stages.map((st) => {
+      const hit = c.outlines?.interference?.find((r) => r.stageIndex === st.index)
+      return hit ? { ...hit, angles: [...hit.angles], regions: hit.regions.map((r) => r.map((q) => ({ ...q }))) } : null
+    })
+    playing.value = false
+  }
+  applyingCase = false
+}
+
+async function loadCase(c: CaseData) {
+  applyCase(c)
 }
 
 async function removeCase(id: string) {
   await deleteCase(id)
+  if (editingId === id) editingId = null
   await refreshCases()
 }
 
@@ -275,7 +393,7 @@ function importFile(ev: Event) {
     try {
       const c = parseCase(String(reader.result))
       await saveCase(c)
-      await loadCase(c)
+      applyCase(c)
       await refreshCases()
     } catch (e) {
       alert('导入失败：' + (e as Error).message)
@@ -285,46 +403,74 @@ function importFile(ev: Event) {
   input.value = ''
 }
 
-// ------- 派生显示 -------
-const dims = computed(() => {
-  if (!g1.value || !g2.value || !mesh.value) return null
-  return { g1: g1.value, g2: g2.value, mesh: mesh.value }
-})
+/** 旧双轮案例载入后：另存为三轮惰轮链（惰轮取与首轮相同模数/压力角，默认 z=30） */
+function upgradeToIdler() {
+  applyingCase = true
+  kind.value = 'idler'
+  specs[2] = { z: 30, module: specs[0].module, alphaDeg: specs[0].alphaDeg, faceWidth: specs[0].faceWidth }
+  stageStd[0] = true
+  stageStd[1] = true
+  selectedStage.value = 0
+  interferenceResults.value = [null, null]
+  storedOutlines = null
+  editingId = null
+  caseName.value = caseName.value + '（三轮惰轮链）'
+  rebuild()
+  applyingCase = false
+}
 
-/** 实际啮合线参数 s 的两端（用于接触点滑块） */
-const sBounds = computed<[number, number]>(() => {
-  if (!mesh.value) return [-30, 30]
-  const m = mesh.value
-  const nx = Math.sin(m.alphaPrime),
-    ny = Math.cos(m.alphaPrime)
-  const lo = (m.actionLine.p0.x - m.pitchPoint.x) * nx + (m.actionLine.p0.y - m.pitchPoint.y) * ny
-  const hi = (m.actionLine.p1.x - m.pitchPoint.x) * nx + (m.actionLine.p1.y - m.pitchPoint.y) * ny
-  return [Math.floor(lo * 10) / 10, Math.ceil(hi * 10) / 10]
-})
+// ------- 派生显示 -------
+const gearLabels = computed(() =>
+  kind.value === 'idler' ? ['主动轮 1', '惰轮 2', '从动轮 3'] : ['齿轮 1（z₁）', '齿轮 2（z₂）']
+)
+
+const selectedMesh = computed(() => model.value?.stages[selectedStage.value] ?? null)
 
 function fmt(mm: number) {
   return fmtLen(mm, unit.value)
 }
 
-// 预设样本：标准齿数与极少齿数，便于核对
-function preset(z1: number, z2: number, m = 2, alphaDeg = 20) {
-  gearParams.z1 = z1
-  gearParams.z2 = z2
-  gearParams.m = m
-  gearParams.alphaDeg = alphaDeg
-  gearParams.useStandardCenter = true
+// 预设
+function presetPair(z1: number, z2: number, m = 2, alphaDeg = 20) {
+  kind.value = 'pair'
+  specs[0] = { z: z1, module: m, alphaDeg, faceWidth: 10 }
+  specs[1] = { z: z2, module: m, alphaDeg, faceWidth: 10 }
+  stageStd[0] = true
+}
+function presetIdler(z1: number, z2: number, z3: number, m = 2, alphaDeg = 20) {
+  kind.value = 'idler'
+  specs[0] = { z: z1, module: m, alphaDeg, faceWidth: 10 }
+  specs[1] = { z: z2, module: m, alphaDeg, faceWidth: 10 }
+  specs[2] = { z: z3, module: m, alphaDeg, faceWidth: 10 }
+  stageStd[0] = true
+  stageStd[1] = true
+}
+/** 故意制造不匹配，演示"拒绝半成品链条" */
+function presetMismatch(which: 'module' | 'alpha') {
+  kind.value = 'idler'
+  presetIdler(20, 30, 40, 2, 20)
+  if (which === 'module') specs[1].module = 2.1
+  else specs[2].alphaDeg = 14.5
 }
 </script>
 
 <template>
   <div class="app">
     <header>
-      <h1>直齿圆柱齿轮参数化实验室</h1>
-      <div class="sub">外啮合 · 无变位 · 理想刚性 · 渐开线齿廓（教学模型）</div>
+      <h1>直齿圆柱齿轮传动链实验室</h1>
+      <div class="sub">外啮合 · 无变位 · 理想刚性 · 渐开线齿廓 · 可配置双轮 / 三轮惰轮链（教学模型）</div>
     </header>
 
     <main>
       <aside class="panel">
+        <section>
+          <h2>传动链形式</h2>
+          <div class="units">
+            <button :class="{ active: kind === 'pair' }" @click="kind = 'pair'">双轮（一对外啮合）</button>
+            <button :class="{ active: kind === 'idler' }" @click="kind = 'idler'">三轮（惰轮链）</button>
+          </div>
+        </section>
+
         <section>
           <h2>显示单位（不改变实际尺寸）</h2>
           <div class="units">
@@ -335,57 +481,75 @@ function preset(z1: number, z2: number, m = 2, alphaDeg = 20) {
         </section>
 
         <section>
-          <h2>齿轮参数</h2>
-          <label>压力角 α（度）
-            <input type="number" v-model.number="gearParams.alphaDeg" min="1" max="45" step="0.5" />
-          </label>
-          <label>模数 m（{{ UNITS[unit].label }}）
-            <input type="number" v-model.number="mInput" :step="UNITS[unit].step" />
-          </label>
-          <label>齿宽 b（{{ UNITS[unit].label }}）
-            <input type="number" v-model.number="faceInput" :step="UNITS[unit].step" />
-          </label>
-          <div class="two">
-            <label>齿数 z₁
-              <input type="number" v-model.number="gearParams.z1" min="4" step="1" />
-            </label>
-            <label>齿数 z₂
-              <input type="number" v-model.number="gearParams.z2" min="4" step="1" />
-            </label>
+          <h2>各轮参数（模数/压力角逐段必须一致）</h2>
+          <div v-for="i in activeCount()" :key="i" class="gearblock">
+            <div class="gearhead">{{ gearLabels[i - 1] }}</div>
+            <div class="two">
+              <label>齿数 z
+                <input type="number" v-model.number="specs[i - 1].z" min="4" step="1" />
+              </label>
+              <label>压力角 α（度）
+                <input type="number" v-model.number="specs[i - 1].alphaDeg" min="1" max="45" step="0.5" />
+              </label>
+            </div>
+            <div class="two">
+              <label>模数 m（{{ UNITS[unit].label }}）
+                <input type="number" v-model.number="mFields[i - 1]" :step="UNITS[unit].step" />
+              </label>
+              <label>齿宽 b（{{ UNITS[unit].label }}）
+                <input type="number" v-model.number="bFields[i - 1]" :step="UNITS[unit].step" />
+              </label>
+            </div>
+            <div v-if="gearErrors[i - 1].length" class="err">{{ gearErrors[i - 1].join('；') }}</div>
           </div>
-          <div v-if="errors.g1.length" class="err">{{ errors.g1.join('；') }}</div>
-          <div v-if="errors.g2.length" class="err">{{ errors.g2.join('；') }}</div>
+          <div v-if="chainErrors.length" class="err chainerr">
+            <div v-for="(e, i) in chainErrors" :key="i">⛔ {{ e }}</div>
+            <div>已拒绝形成传动链（不会用总速比硬套末轮产生半成品）。</div>
+          </div>
         </section>
 
         <section>
-          <h2>中心距</h2>
-          <label class="row">
-            <input type="checkbox" v-model="gearParams.useStandardCenter" /> 使用标准中心距 a₀ = m(z₁+z₂)/2
-          </label>
-          <label v-if="!gearParams.useStandardCenter">实际中心距 a（{{ UNITS[unit].label }}）
-            <input type="number" v-model.number="centerInput" :step="UNITS[unit].step" />
-          </label>
+          <h2>各段中心距</h2>
+          <div v-for="i in activeCount() - 1" :key="'c' + i" class="stageblock">
+            <label class="row">
+              <input type="checkbox" v-model="stageStd[i - 1]" />
+              第 {{ i }} 段使用标准中心距 a₀ = m(z{{ i }}+z{{ i + 1 }})/2
+            </label>
+            <label v-if="!stageStd[i - 1]">实际中心距 a（{{ UNITS[unit].label }}）
+              <input type="number" v-model.number="cFields[i - 1]" :step="UNITS[unit].step" />
+            </label>
+          </div>
         </section>
 
         <section>
           <h2>运动 / 检查</h2>
           <div class="row">
             <button @click="pause" :disabled="!playing">暂停</button>
-            <button @click="resume" :disabled="playing">继续</button>
+            <button @click="resume" :disabled="playing || !model">继续</button>
           </div>
-          <label>轮1 角速度（rad/s）
+          <label>首轮角速度（rad/s）
             <input type="range" v-model.number="speed" min="0" max="1.5" step="0.01" />
           </label>
-          <label>接触点沿啮合线 s（mm，暂停可拖动）
-            <input type="range" :disabled="playing" v-model.number="contactS" :min="sBounds[0]" :max="sBounds[1]" step="0.05" @input="scrubContact" />
+
+          <div class="row" v-if="model">
+            <button v-for="(st, i) in model.stages" :key="i" :class="{ active: selectedStage === i }" @click="selectedStage = i">
+              检查第 {{ i + 1 }} 段（轮{{ st.leftIndex + 1 }}–轮{{ st.rightIndex + 1 }}）
+            </button>
+          </div>
+
+          <label>第 {{ selectedStage + 1 }} 段接触点 s（mm，暂停可拖动）
+            <input type="range" :disabled="playing || !model" v-model.number="scrubS" :min="sBounds[0]" :max="sBounds[1]" step="0.05" @input="scrubContact" />
           </label>
-          <button class="wide" @click="checkInterference(phi1)" :disabled="playing || interferenceBusy">
-            {{ interferenceBusy ? 'Clipper 求交中…' : '在当前帧做局部干涉求交（Clipper2 WASM）' }}
-          </button>
-          <div v-if="interferenceArea !== null" class="report">
-            重叠面积 = {{ interferenceArea.toExponential(3) }} mm²
-            <b :class="interferenceArea > 1e-6 ? 'bad' : 'good'">
-              {{ interferenceArea > 1e-6 ? '存在实体干涉 ❗' : '当前帧无干涉 ✅' }}
+          <div class="row">
+            <button @click="checkStageInterference(selectedStage)" :disabled="playing || !model || busyStages[selectedStage]">
+              {{ busyStages[selectedStage] ? 'Clipper 求交中…' : `检查第 ${selectedStage + 1} 段局部干涉` }}
+            </button>
+            <button @click="checkAllStages" :disabled="playing || !model">两段都查</button>
+          </div>
+          <div v-for="(r, i) in interferenceResults" :key="i" v-show="r" class="report">
+            第 {{ i + 1 }} 段重叠面积 = {{ r ? r.area.toExponential(3) : '' }} mm²
+            <b :class="r && r.area > 1e-6 ? 'bad' : 'good'">
+              {{ r ? (r.area > 1e-6 ? '存在实体干涉 ❗' : '当前帧无干涉 ✅') : '' }}
             </b>
           </div>
         </section>
@@ -403,10 +567,13 @@ function preset(z1: number, z2: number, m = 2, alphaDeg = 20) {
         <section>
           <h2>核对样本</h2>
           <div class="samples">
-            <button @click="preset(20,40)">20/40 标准</button>
-            <button @click="preset(17,17)">17/17 临界</button>
-            <button @click="preset(16,40)">16/40 根切</button>
-            <button @click="preset(12,40)">12/40 极少齿</button>
+            <button @click="presetPair(20,40)">双轮 20/40</button>
+            <button @click="presetPair(17,17)">双轮 17/17</button>
+            <button @click="presetIdler(20,30,40)">三轮 20/30/40</button>
+            <button @click="presetIdler(18,24,36)">三轮 18/24/36</button>
+            <button @click="presetIdler(12,30,28, 3)">三轮少齿 12/30/28</button>
+            <button class="del" @click="presetMismatch('module')">模数不匹配演示</button>
+            <button class="del" @click="presetMismatch('alpha')">压力角不匹配演示</button>
           </div>
         </section>
       </aside>
@@ -415,62 +582,111 @@ function preset(z1: number, z2: number, m = 2, alphaDeg = 20) {
         <div ref="host" class="canvas-host"></div>
 
         <div class="readouts">
-          <div v-if="dims" class="dim-grid">
+          <div v-if="model" class="dim-grid">
             <table>
-              <thead><tr><th></th><th>齿轮 1（z₁={{ gearParams.z1 }}）</th><th>齿轮 2（z₂={{ gearParams.z2 }}）</th></tr></thead>
+              <thead>
+                <tr>
+                  <th></th>
+                  <th v-for="(g, i) in model.gears" :key="i">{{ gearLabels[i] }}（z={{ g.input.z }}）</th>
+                </tr>
+              </thead>
               <tbody>
-                <tr><td>分度圆直径 d</td><td>{{ fmt(dims.g1.pitchR * 2) }}</td><td>{{ fmt(dims.g2.pitchR * 2) }}</td></tr>
-                <tr><td>基圆直径 d_b</td><td>{{ fmt(dims.g1.baseR * 2) }}</td><td>{{ fmt(dims.g2.baseR * 2) }}</td></tr>
-                <tr><td>齿顶圆 d_a</td><td>{{ fmt(dims.g1.addendumR * 2) }}</td><td>{{ fmt(dims.g2.addendumR * 2) }}</td></tr>
-                <tr><td>齿根圆 d_f</td><td>{{ fmt(dims.g1.dedendumR * 2) }}</td><td>{{ fmt(dims.g2.dedendumR * 2) }}</td></tr>
-                <tr><td>齿距 p = πm</td><td>{{ fmt(dims.g1.circularPitch) }}</td><td>{{ fmt(dims.g2.circularPitch) }}</td></tr>
-                <tr><td>基节 p_b</td><td>{{ fmt(dims.g1.basePitch) }}</td><td>{{ fmt(dims.g2.basePitch) }}</td></tr>
-                <tr><td>齿顶压力角 α_a</td><td>{{ (dims.g1.alphaTip / DEG).toFixed(2) }}°</td><td>{{ (dims.g2.alphaTip / DEG).toFixed(2) }}°</td></tr>
-                <tr><td>根切风险 (z&lt;{{ dims.g1.zMinValue.toFixed(1) }})</td>
-                  <td :class="dims.g1.undercut ? 'bad' : 'good'">{{ dims.g1.undercut ? '根切 ❗' : '安全' }}</td>
-                  <td :class="dims.g2.undercut ? 'bad' : 'good'">{{ dims.g2.undercut ? '根切 ❗' : '安全' }}</td></tr>
+                <tr>
+                  <td>分度圆直径 d</td>
+                  <td v-for="(g, i) in model.gears" :key="i">{{ fmt(g.pitchR * 2) }}</td>
+                </tr>
+                <tr>
+                  <td>基圆直径 d_b</td>
+                  <td v-for="(g, i) in model.gears" :key="i">{{ fmt(g.baseR * 2) }}</td>
+                </tr>
+                <tr>
+                  <td>齿顶圆 d_a</td>
+                  <td v-for="(g, i) in model.gears" :key="i">{{ fmt(g.addendumR * 2) }}</td>
+                </tr>
+                <tr>
+                  <td>齿根圆 d_f</td>
+                  <td v-for="(g, i) in model.gears" :key="i">{{ fmt(g.dedendumR * 2) }}</td>
+                </tr>
+                <tr>
+                  <td>基节 p_b = πm·cosα</td>
+                  <td v-for="(g, i) in model.gears" :key="i">{{ fmt(g.basePitch) }}</td>
+                </tr>
+                <tr>
+                  <td>齿顶压力角 α_a</td>
+                  <td v-for="(g, i) in model.gears" :key="i">{{ (g.alphaTip / DEG).toFixed(2) }}°</td>
+                </tr>
+                <tr>
+                  <td>根切风险</td>
+                  <td v-for="(g, i) in model.gears" :key="i" :class="g.undercut ? 'bad' : 'good'">
+                    {{ g.undercut ? `z<${g.zMinValue.toFixed(1)} 根切 ❗` : '安全' }}
+                  </td>
+                </tr>
               </tbody>
             </table>
 
             <div class="mesh-report">
-              <h3>啮合检查</h3>
-              <div>标准中心距 a₀：<b>{{ fmt(dims.mesh.a0) }}</b></div>
-              <div>实际中心距 a：<b>{{ fmt(dims.mesh.a) }}</b>（Δa = {{ fmt(dims.mesh.deltaA) }}）</div>
-              <div>啮合角 α′：<b>{{ (dims.mesh.alphaPrime / DEG).toFixed(3) }}°</b></div>
-              <div>节圆半径 r₁′/r₂′：<b>{{ fmt(dims.mesh.pitchR1) }} / {{ fmt(dims.mesh.pitchR2) }}</b></div>
-              <div>实际啮合线长度 g_α：<b>{{ fmt(dims.mesh.pathOfContact) }}</b></div>
-              <div>重合度 ε_α = g_α/p_b：<b :class="dims.mesh.contactRatio < 1 ? 'bad' : 'good'">{{ dims.mesh.contactRatio.toFixed(3) }}</b></div>
-              <div>圆周/法向侧隙：<b>{{ fmt(dims.mesh.backlashTangential) }} / {{ fmt(dims.mesh.backlashNormal) }}</b></div>
-              <div>顶隙 c：<b>{{ fmt(dims.mesh.clearance12) }}</b></div>
-              <div>基节一致：<b :class="dims.mesh.basePitchMatch ? 'good' : 'bad'">{{ dims.mesh.basePitchMatch ? '是 ✅' : '否 ❌' }}</b></div>
-              <ul v-if="dims.mesh.warnings.length" class="warns">
-                <li v-for="(w, i) in dims.mesh.warnings" :key="i">⚠️ {{ w }}</li>
+              <h3>传动链总关系（由两段真实啮合决定，不是直接套总速比）</h3>
+              <div v-if="model.total">
+                外啮合次数：<b>{{ model.total.externalMeshCount }}</b>；
+                首末轮转向：<b :class="model.total.sameDirection ? 'good' : 'bad'">
+                  {{ model.total.sameDirection ? '同向 ✅（惰轮使方向反转两次）' : '反向 ✅' }}
+                </b>
+              </div>
+              <div v-if="model.total">
+                总速比 ω末/ω首 = (−1)^n·z首/z末 =
+                <b>{{ model.total.ratio.toFixed(5) }}</b>
+                （即 {{ (model.total.ratio * model.total.lastZ / model.total.firstZ).toFixed(3) }}·{{ model.total.firstZ }}/{{ model.total.lastZ }}）
+              </div>
+              <div v-for="(st, i) in model.stages" :key="i" class="stageline">
+                第 {{ i + 1 }} 段速比 ω{{ st.rightIndex + 1 }}/ω{{ st.leftIndex + 1 }} =
+                −{{ model.gears[st.leftIndex].input.z }}/{{ model.gears[st.rightIndex].input.z }}
+                = {{ (-model.gears[st.leftIndex].input.z / model.gears[st.rightIndex].input.z).toFixed(4) }}（反向）
+              </div>
+
+              <template v-if="selectedMesh">
+                <h3 style="margin-top:8px">第 {{ selectedStage + 1 }} 段啮合检查</h3>
+                <div>标准中心距 a₀：<b>{{ fmt(selectedMesh.info.a0) }}</b></div>
+                <div>实际中心距 a：<b>{{ fmt(selectedMesh.info.a) }}</b>（Δa = {{ fmt(selectedMesh.info.deltaA) }}）</div>
+                <div>啮合角 α′：<b>{{ (selectedMesh.info.alphaPrime / DEG).toFixed(3) }}°</b></div>
+                <div>节圆半径 r′：<b>{{ fmt(selectedMesh.info.pitchR1) }} / {{ fmt(selectedMesh.info.pitchR2) }}</b></div>
+                <div>实际啮合线长度 g_α：<b>{{ fmt(selectedMesh.info.pathOfContact) }}</b></div>
+                <div>重合度 ε_α：<b :class="selectedMesh.info.contactRatio < 1 ? 'bad' : 'good'">{{ selectedMesh.info.contactRatio.toFixed(3) }}</b></div>
+                <div>圆周/法向侧隙：<b>{{ fmt(selectedMesh.info.backlashTangential) }} / {{ fmt(selectedMesh.info.backlashNormal) }}</b></div>
+                <div>顶隙 c：<b>{{ fmt(selectedMesh.info.clearance12) }}</b></div>
+                <div>基节一致：<b :class="selectedMesh.info.basePitchMatch ? 'good' : 'bad'">{{ selectedMesh.info.basePitchMatch ? '是 ✅' : '否 ❌' }}</b></div>
+              </template>
+              <ul v-if="model.warnings.length" class="warns">
+                <li v-for="(w, i) in model.warnings" :key="i">⚠️ {{ w }}</li>
               </ul>
               <div class="formula">
-                渐开线：x=r_b(sin t−t cos t)，y=r_b(cos t+t sin t)；inv(α)=tanα−α；
-                啮合要求基节相等 + 相位共法线，且 r_b1·Δφ₁ = −r_b2·Δφ₂（不是只按转速比旋转）。
+                每段独立满足：基节相等 + 节点共法线 + 同一条渐开线滚动（r_b左·Δφ左 = −r_b右·Δφ右）。
+                姿态沿 φ1→s1→φ2→s2→φ3 严格传播；惰轮只改方向、不入总速比幅值。
               </div>
             </div>
+          </div>
+          <div v-else-if="chainErrors.length" class="banned">
+            传动链未形成：{{ chainErrors.join('；') }}
           </div>
         </div>
       </section>
 
       <aside class="panel right">
         <section>
-          <h2>案例（IndexedDB）</h2>
+          <h2>案例（IndexedDB，schema v2）</h2>
           <input v-model="caseName" placeholder="案例名称" />
           <textarea v-model="caseNote" placeholder="备注（可选）" rows="2"></textarea>
           <div class="row">
-            <button @click="saveCurrent(true)">保存（含轮廓）</button>
-            <button @click="saveCurrent(false)">仅参数</button>
+            <button @click="saveCurrent(true)" :disabled="!model">保存（含轮廓/检查）</button>
+            <button @click="saveCurrent(false)" :disabled="!model">仅参数</button>
           </div>
           <div class="row">
-            <button @click="exportCase(true)">导出 JSON+轮廓</button>
-            <button @click="exportCase(false)">导出参数</button>
+            <button @click="exportCase(true)" :disabled="!model">导出 JSON+轮廓</button>
+            <button @click="exportCase(false)" :disabled="!model">导出参数</button>
           </div>
-          <label class="wide filebtn">导入 JSON
+          <label class="wide filebtn">导入 JSON（v2 / 旧 v1 自动迁移）
             <input type="file" accept="application/json,.json" @change="importFile" hidden />
           </label>
+          <button class="wide" @click="upgradeToIdler" :disabled="!model || kind === 'idler'">把当前双轮另存为三轮惰轮链</button>
         </section>
         <section>
           <h2>已存案例</h2>
@@ -478,7 +694,10 @@ function preset(z1: number, z2: number, m = 2, alphaDeg = 20) {
             <li v-for="c in cases" :key="c.id">
               <div class="ci">
                 <b>{{ c.name }}</b>
-                <span>{{ c.gear1.z }}/{{ c.gear2.z }} · m={{ c.gear1.module }} · α={{ c.gear1.alphaDeg }}°{{ c.outlines ? ' · 含轮廓' : '' }}</span>
+                <span>
+                  {{ c.kind === 'idler' ? '三轮' : '双轮' }} ·
+                  {{ c.gears.map((g) => g.z).join('/') }} · m={{ c.gears[0].module }} · α={{ c.gears[0].alphaDeg }}°{{ c.outlines ? ' · 含轮廓' : '' }}
+                </span>
               </div>
               <div class="ca">
                 <button @click="loadCase(c)">载入</button>
