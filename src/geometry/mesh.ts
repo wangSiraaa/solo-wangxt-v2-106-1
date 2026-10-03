@@ -202,27 +202,97 @@ export function gearAnglesAt(mesh: MeshInfo, g1: GearGeometry, g2: GearGeometry,
   return { phi1, phi2, t1, t2 }
 }
 
-/** 轮1 本体转角 φ1 求配对转角 φ2：先反解 s 再走严格相位公式（保证同一条渐开线接触） */
+/** 轮1（主动侧）本体转角 φ1 求配对转角 φ2：先反解 s 再走严格相位公式（保证同一条渐开线接触） */
 export function mateAngle(g1: GearGeometry, g2: GearGeometry, mesh: MeshInfo, phi1: number) {
+  const s = solveSForDriver(mesh, g1, phi1)
+  return gearAnglesAt(mesh, g1, g2, s).phi2
+}
+
+/**
+ * 由主动侧本体转角 φ1 严格反解啮合线参数 s（dφ1/ds = +1/rb1，单调，牛顿法）。
+ * 三轮链中：第一段反解出 s₁ 与惰轮转角；惰轮同时是第二段的主动轮。
+ */
+export function solveSForDriver(mesh: MeshInfo, g1: GearGeometry, phi1: number): number {
   const ap = mesh.alphaPrime
   const sn = Math.sin(ap),
     cn = Math.cos(ap)
-  // 由 φ1 = ψ1(s) − (π/2+β1−δ(t1)) 数值反解 s（dφ1/ds=1/rb1 单调，牛顿法）
   let s = 0
-  for (let iter = 0; iter < 30; iter++) {
+  for (let iter = 0; iter < 40; iter++) {
     const t1 = Math.tan(ap) + s / g1.baseR
     const delta1 = t1 - Math.atan(t1)
     const theta1 = Math.PI / 2 + g1.beta - delta1
     const psi1 = Math.atan2(s * cn, mesh.pitchR1 + s * sn)
     const f = psi1 - theta1 - phi1
     s -= f / (1 / g1.baseR)
-    if (Math.abs(f) < 1e-12) break
+    if (Math.abs(f) < 1e-13) break
   }
-  const t2 = Math.tan(ap) - s / g2.baseR
-  const delta2 = t2 - Math.atan(t2)
-  const theta2 = Math.PI / 2 + g2.beta - delta2
-  const psi2 = Math.atan2(s * cn, -mesh.pitchR2 + s * sn)
-  return psi2 - theta2
+  return s
+}
+
+/**
+ * 由从动侧本体转角 φ2 反解啮合线参数 s（dφ2/ds = −1/rb2，单调）。
+ * 三轮链中用于"拖动第二段接触位置"：给定惰轮转角反推第一段接触参数与轮1转角。
+ */
+export function solveSForDriven(mesh: MeshInfo, g2: GearGeometry, phi2: number): number {
+  const ap = mesh.alphaPrime
+  const sn = Math.sin(ap),
+    cn = Math.cos(ap)
+  let s = 0
+  for (let iter = 0; iter < 40; iter++) {
+    const t2 = Math.tan(ap) - s / g2.baseR
+    const delta2 = t2 - Math.atan(t2)
+    const theta2 = Math.PI / 2 + g2.beta - delta2
+    const psi2 = Math.atan2(s * cn, -mesh.pitchR2 + s * sn)
+    const f = psi2 - theta2 - phi2
+    s -= f / (-1 / g2.baseR)
+    if (Math.abs(f) < 1e-13) break
+  }
+  return s
+}
+
+/** 实际啮合线段端点投影到啮合线方向 n，返回参数区间 [s_enter, s_exit] */
+export function actionBounds(mesh: MeshInfo): [number, number] {
+  const nx = Math.sin(mesh.alphaPrime),
+    ny = Math.cos(mesh.alphaPrime)
+  const lo =
+    (mesh.actionLine.p0.x - mesh.pitchPoint.x) * nx +
+    (mesh.actionLine.p0.y - mesh.pitchPoint.y) * ny
+  const hi =
+    (mesh.actionLine.p1.x - mesh.pitchPoint.x) * nx +
+    (mesh.actionLine.p1.y - mesh.pitchPoint.y) * ny
+  return [Math.min(lo, hi), Math.max(lo, hi)]
+}
+
+/**
+ * 把任意 s 按【基节 p_b】周期性折叠进实际啮合线段 [s_enter, s_exit]。
+ * 与 wrapToAction（按啮合段长度取模，仅用于旧滑块循环显示）不同：
+ * 沿啮合线每平移一个基节 p_b，接触点换到相邻一对齿，而两轮本体转角恰各转
+ * 一个整齿距角（2π/z），姿态在齿轮对称性下完全等价。因此只有按 p_b 折叠，
+ * 得到的才是当前真正接触的齿对，接触点落在真实齿面上（重合度 ε>1 时必有解）。
+ */
+export function reduceToAction(mesh: MeshInfo, s: number, basePitch: number): number {
+  const [lo, hi] = actionBounds(mesh)
+  if (!(basePitch > 1e-12)) return s
+  const mid = (lo + hi) / 2
+  const k = Math.round((s - mid) / basePitch)
+  let r = s - k * basePitch
+  // ε<1（实际啮合段短于基节）时折叠结果可能越界，夹到最近端点
+  if (r < lo) r = lo
+  if (r > hi) r = hi
+  return r
+}
+
+/**
+ * 把任意 s 循环折叠进实际啮合线段 [s_enter, s_exit]（跨齿周期时接触点进入下一齿）。
+ * 只影响接触点显示；s 相差一个基节 p_b 时两轮本体转角恰差整周齿距角，姿态等价。
+ */
+export function wrapToAction(mesh: MeshInfo, s: number): number {
+  const [lo, hi] = actionBounds(mesh)
+  const span = hi - lo
+  if (!(span > 1e-9)) return 0
+  if (s < lo) return hi - ((lo - s) % span)
+  if (s > hi) return lo + ((s - hi) % span)
+  return s
 }
 
 /** 接触点世界坐标 */
